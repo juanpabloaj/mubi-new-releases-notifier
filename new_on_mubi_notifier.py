@@ -7,6 +7,7 @@ import os
 import re
 import sqlite3
 import sys
+import time
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -374,19 +375,40 @@ def format_telegram_message(row: Dict[str, Any]) -> str:
 
 
 def send_telegram_message(bot_token: str, chat_id: str, message: str) -> None:
-    response = requests.post(
-        f"https://api.telegram.org/bot{bot_token}/sendMessage",
-        data={
-            "chat_id": chat_id,
-            "text": message,
-            "disable_web_page_preview": "true",
-        },
-        timeout=30,
-    )
-    response.raise_for_status()
-    payload = response.json()
-    if not payload.get("ok"):
-        raise RuntimeError(f"Telegram API error: {payload}")
+    max_attempts = 6
+    for attempt in range(1, max_attempts + 1):
+        response = requests.post(
+            f"https://api.telegram.org/bot{bot_token}/sendMessage",
+            data={
+                "chat_id": chat_id,
+                "text": message,
+                "disable_web_page_preview": "true",
+            },
+            timeout=30,
+        )
+        payload = {}
+        try:
+            payload = response.json()
+        except ValueError:
+            payload = {}
+
+        if response.status_code == 429:
+            retry_after = payload.get("parameters", {}).get("retry_after", 5)
+            LOGGER.warning(
+                "Telegram rate limit hit. Waiting %s seconds before retry %s/%s.",
+                retry_after,
+                attempt,
+                max_attempts,
+            )
+            time.sleep(retry_after)
+            continue
+
+        response.raise_for_status()
+        if not payload.get("ok"):
+            raise RuntimeError(f"Telegram API error: {payload}")
+        return
+
+    raise RuntimeError("Telegram rate limit retries exhausted.")
 
 
 def notify_new_films(rows: List[Dict[str, Any]], env_path: str, db_path: str) -> int:
@@ -403,6 +425,7 @@ def notify_new_films(rows: List[Dict[str, Any]], env_path: str, db_path: str) ->
         for row in pending_rows:
             send_telegram_message(bot_token, chat_id, format_telegram_message(row))
             mark_notified(connection, row["slug"])
+            time.sleep(1)
         return len(pending_rows)
 
 
