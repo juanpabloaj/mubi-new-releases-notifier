@@ -19,14 +19,18 @@ This project fetches the `New on MUBI` collection, writes a ranked CSV, stores f
 
 ## Requirements
 
+- `uv`
 - Python 3.10+
-- `requests`
 
-Install dependencies if needed:
+Create the virtual environment and install dependencies:
 
 ```bash
-python -m pip install requests
+uv venv .venv
+source .venv/bin/activate
+uv sync
 ```
+
+You can also run the script directly with `uv run` without activating the virtual environment.
 
 ## Environment variables
 
@@ -64,7 +68,7 @@ The CSV is written sorted by `score_rank` ascending.
 This fetches the collection and writes the CSV only:
 
 ```bash
-python new_on_mubi_notifier.py \
+uv run new_on_mubi_notifier.py \
   --url "https://mubi.com/en/cl/collections/new-on-mubi" \
   --out "new_on_mubi.csv"
 ```
@@ -74,13 +78,15 @@ python new_on_mubi_notifier.py \
 This fetches the collection, writes the CSV, updates SQLite, and sends notifications for films that have not been notified before:
 
 ```bash
-python new_on_mubi_notifier.py \
+uv run new_on_mubi_notifier.py \
   --url "https://mubi.com/en/cl/collections/new-on-mubi" \
   --out "new_on_mubi.csv" \
   --db-path "mubi_notifications.db" \
   --env-file ".env" \
   --notify
 ```
+
+If you have already activated `.venv`, `python new_on_mubi_notifier.py` also works.
 
 ## Notification behavior
 
