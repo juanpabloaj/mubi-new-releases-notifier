@@ -108,7 +108,9 @@ def bootstrap_context(session: requests.Session, collection_url: str) -> Dict[st
     return {"collection": collection, "http_context": http_context}
 
 
-def build_api_headers(collection_url: str, http_context: Dict[str, Any]) -> Dict[str, str]:
+def build_api_headers(
+    collection_url: str, http_context: Dict[str, Any]
+) -> Dict[str, str]:
     defaults = parse_url_defaults(collection_url)
     anonymous_user_id = http_context.get("ANONYMOUS_USER_ID") or str(uuid.uuid4())
     return {
@@ -197,7 +199,9 @@ def add_rankings(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     )
 
     score_rank = {row["slug"]: index + 1 for index, row in enumerate(by_score)}
-    popularity_rank = {row["slug"]: index + 1 for index, row in enumerate(by_popularity)}
+    popularity_rank = {
+        row["slug"]: index + 1 for index, row in enumerate(by_popularity)
+    }
 
     enriched_rows = []
     for row in rows:
@@ -249,11 +253,12 @@ def write_csv(rows: List[Dict[str, Any]], output_path: str) -> None:
         writer.writerows(rows_for_csv(rows))
 
 
-def print_preview(rows: List[Dict[str, Any]], limit: int = 10) -> None:
-    ordered_rows = rows_for_csv(rows)
-    LOGGER.info("Extracted films: %s", len(ordered_rows))
-    LOGGER.info("Top rows by score rank:")
-    for row in ordered_rows[:limit]:
+def log_pending_rows(rows: List[Dict[str, Any]], limit: int = 10) -> None:
+    LOGGER.info("Pending new films: %s", len(rows))
+    if not rows:
+        return
+    LOGGER.info("Pending films to be added or notified:")
+    for row in rows[:limit]:
         LOGGER.info(
             "%2s. %s | %s | %s | %s | %s | %s",
             row["score_rank"],
@@ -296,7 +301,9 @@ def init_db(connection: sqlite3.Connection) -> None:
     connection.commit()
 
 
-def sync_films_to_db(connection: sqlite3.Connection, rows: List[Dict[str, Any]]) -> None:
+def sync_films_to_db(
+    connection: sqlite3.Connection, rows: List[Dict[str, Any]]
+) -> None:
     synced_at = utc_now_iso()
     for row in rows:
         connection.execute(
@@ -334,7 +341,9 @@ def sync_films_to_db(connection: sqlite3.Connection, rows: List[Dict[str, Any]])
     connection.commit()
 
 
-def get_unnotified_rows(connection: sqlite3.Connection, current_slugs: List[str]) -> List[Dict[str, Any]]:
+def get_unnotified_rows(
+    connection: sqlite3.Connection, current_slugs: List[str]
+) -> List[Dict[str, Any]]:
     if not current_slugs:
         return []
     placeholders = ", ".join("?" for _ in current_slugs)
@@ -410,22 +419,22 @@ def send_telegram_message(bot_token: str, chat_id: str, message: str) -> None:
     raise RuntimeError("Telegram rate limit retries exhausted.")
 
 
-def notify_new_films(rows: List[Dict[str, Any]], env_path: str, db_path: str) -> int:
+def notify_rows(
+    connection: sqlite3.Connection, rows: List[Dict[str, Any]], env_path: str
+) -> int:
     load_dotenv(env_path)
     bot_token = os.getenv("TELEGRAM_BOT_TOKEN")
     chat_id = os.getenv("TELEGRAM_CHAT_ID")
     if not bot_token or not chat_id:
-        raise RuntimeError("TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID must be set to send notifications.")
+        raise RuntimeError(
+            "TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID must be set to send notifications."
+        )
 
-    with sqlite3.connect(db_path) as connection:
-        init_db(connection)
-        sync_films_to_db(connection, rows)
-        pending_rows = get_unnotified_rows(connection, [row["slug"] for row in rows])
-        for row in pending_rows:
-            send_telegram_message(bot_token, chat_id, format_telegram_message(row))
-            mark_notified(connection, row["slug"])
-            time.sleep(1)
-        return len(pending_rows)
+    for row in rows:
+        send_telegram_message(bot_token, chat_id, format_telegram_message(row))
+        mark_notified(connection, row["slug"])
+        time.sleep(1)
+    return len(rows)
 
 
 def main() -> int:
@@ -439,11 +448,21 @@ def main() -> int:
             "for newly added films using SQLite state."
         )
     )
-    parser.add_argument("--url", default=DEFAULT_COLLECTION_URL, help="MUBI collection URL.")
+    parser.add_argument(
+        "--url", default=DEFAULT_COLLECTION_URL, help="MUBI collection URL."
+    )
     parser.add_argument("--out", default=DEFAULT_CSV_PATH, help="Output CSV path.")
-    parser.add_argument("--db-path", default=DEFAULT_DB_PATH, help="SQLite database path.")
-    parser.add_argument("--env-file", default=DEFAULT_ENV_PATH, help="Environment file path.")
-    parser.add_argument("--notify", action="store_true", help="Send Telegram notifications for newly seen films.")
+    parser.add_argument(
+        "--db-path", default=DEFAULT_DB_PATH, help="SQLite database path."
+    )
+    parser.add_argument(
+        "--env-file", default=DEFAULT_ENV_PATH, help="Environment file path."
+    )
+    parser.add_argument(
+        "--notify",
+        action="store_true",
+        help="Send Telegram notifications for newly seen films.",
+    )
     args = parser.parse_args()
 
     rows = add_rankings(scrape_collection(args.url))
@@ -452,12 +471,18 @@ def main() -> int:
         return 1
 
     write_csv(rows, args.out)
-    print_preview(rows, limit=12)
     LOGGER.info("CSV written to: %s", args.out)
 
-    if args.notify:
-        sent_count = notify_new_films(rows, env_path=args.env_file, db_path=args.db_path)
-        LOGGER.info("Telegram notifications sent: %s", sent_count)
+    with sqlite3.connect(args.db_path) as connection:
+        init_db(connection)
+        sync_films_to_db(connection, rows)
+        pending_rows = get_unnotified_rows(connection, [row["slug"] for row in rows])
+
+        log_pending_rows(pending_rows, limit=12)
+
+        if args.notify:
+            sent_count = notify_rows(connection, pending_rows, env_path=args.env_file)
+            LOGGER.info("Telegram notifications sent: %s", sent_count)
 
     return 0
 
