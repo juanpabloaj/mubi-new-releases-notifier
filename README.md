@@ -1,10 +1,11 @@
 # MUBI New On MUBI Notifier
 
-This project fetches the `New on MUBI` collection, writes a ranked CSV, stores film state in SQLite, and can send one Telegram notification per newly detected film.
+This project fetches the `New on MUBI` collection, optionally enriches films with external ratings, writes a ranked CSV, stores film state in SQLite, and can send one Telegram notification per newly detected film.
 
 ## What it does
 
 - Fetches the current collection from MUBI using the public web page plus the MUBI API.
+- Optionally enriches films with IMDb, Rotten Tomatoes, and Metacritic ratings through OMDb.
 - Exports a CSV sorted by `score_rank`.
 - Stores film metadata locally in SQLite.
 - Sends Telegram messages only once per film.
@@ -13,7 +14,7 @@ This project fetches the `New on MUBI` collection, writes a ranked CSV, stores f
 ## Files
 
 - `new_on_mubi_notifier.py`: main script
-- `.env`: Telegram configuration
+- `.env`: Telegram configuration and optional OMDb API key
 - `new_on_mubi.csv`: latest CSV export
 - `mubi_notifications.db`: local SQLite state, created on first notification run
 
@@ -43,6 +44,14 @@ TELEGRAM_BOT_TOKEN=...
 TELEGRAM_CHAT_ID=...
 ```
 
+Optional for external ratings enrichment:
+
+```env
+OMDB_API_KEY=...
+```
+
+When `OMDB_API_KEY` is set, the script queries OMDb by title and year, then falls back to original title and year. Available IMDb, Rotten Tomatoes, and Metacritic ratings are added to the CSV and Telegram messages. Missing OMDb matches do not stop the run.
+
 ## CSV contents
 
 The CSV includes:
@@ -55,6 +64,11 @@ The CSV includes:
 - `director`
 - `score_10`
 - `ratings_count`
+- `imdb_rating`
+- `imdb_votes`
+- `rotten_tomatoes_rating`
+- `metacritic_rating`
+- `imdb_id`
 - `score_rank`
 - `popularity_rank`
 - `combined_rank`
@@ -97,10 +111,13 @@ If you have already activated `.venv`, `python new_on_mubi_notifier.py` also wor
 Message format:
 
 ```text
-<title> <score_10>
+<title> - MUBI <score_10>
+<IMDb rating> | <Rotten Tomatoes rating> | <Metacritic rating>
 <original_title> | <year> | <origin_country> | <director>
 <url>
 ```
+
+The external ratings line is omitted when no external ratings are available.
 
 ## SQLite schema behavior
 
@@ -109,6 +126,7 @@ The SQLite database stores one row per film, keyed by `slug`.
 It keeps:
 
 - current metadata
+- cached OMDb ratings when available
 - `first_seen_at`
 - `last_seen_at`
 - `notified_at`

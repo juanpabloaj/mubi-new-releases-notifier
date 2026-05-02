@@ -4,10 +4,10 @@
 
 This repository is intentionally small and centered on one Python entrypoint:
 
-- `new_on_mubi_notifier.py`: fetches the MUBI collection, writes the CSV, stores SQLite state, and optionally sends Telegram notifications.
+- `new_on_mubi_notifier.py`: fetches the MUBI collection, optionally enriches external ratings, writes the CSV, stores SQLite state, and optionally sends Telegram notifications.
 - `new_on_mubi.csv`: latest generated export.
 - `mubi_notifications.db`: local SQLite state for deduplicating Telegram notifications.
-- `.env`: local runtime configuration.
+- `.env`: local runtime configuration, including Telegram credentials and optional `OMDB_API_KEY`.
 - `README.md`: usage and setup notes.
 
 If the project grows, keep source code under a dedicated package directory such as `src/` and place tests under `tests/`.
@@ -56,5 +56,6 @@ PRs should include:
 ## Security & Configuration Tips
 
 - Do not commit real bot tokens or private chat IDs.
+- Do not commit real OMDb API keys.
 - Treat `.env` as local-only.
 - SQLite state is part of runtime behavior; do not delete it casually if notification deduplication matters.

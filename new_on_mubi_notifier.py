@@ -21,7 +21,28 @@ DEFAULT_CSV_PATH = "new_on_mubi.csv"
 DEFAULT_DB_PATH = "mubi_notifications.db"
 DEFAULT_ENV_PATH = ".env"
 API_BASE = "https://api.mubi.com/v4"
+OMDB_API_BASE = "https://www.omdbapi.com/"
 LOGGER = logging.getLogger("mubi_notifier")
+OMDB_RATING_FIELDS = [
+    "imdb_id",
+    "imdb_rating",
+    "imdb_votes",
+    "rotten_tomatoes_rating",
+    "metacritic_rating",
+    "omdb_checked_at",
+]
+OMDB_DB_COLUMNS = {
+    "imdb_id": "TEXT",
+    "imdb_rating": "TEXT",
+    "imdb_votes": "TEXT",
+    "rotten_tomatoes_rating": "TEXT",
+    "metacritic_rating": "TEXT",
+    "omdb_checked_at": "TEXT",
+}
+
+
+class OmdbUnavailableError(RuntimeError):
+    pass
 
 
 def load_dotenv(env_path: str) -> None:
@@ -83,6 +104,13 @@ def normalize_film_data(film: Dict[str, Any]) -> Dict[str, Any]:
         "score_10": to_score_10(film.get("average_rating")),
         "ratings_count": film.get("number_of_ratings"),
     }
+
+
+def with_empty_omdb_fields(row: Dict[str, Any]) -> Dict[str, Any]:
+    enriched = dict(row)
+    for field in OMDB_RATING_FIELDS:
+        enriched.setdefault(field, None)
+    return enriched
 
 
 def parse_url_defaults(collection_url: str) -> Dict[str, str]:
@@ -219,6 +247,155 @@ def add_rankings(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     return enriched_rows
 
 
+def parse_omdb_ratings(payload: Dict[str, Any]) -> Dict[str, Optional[str]]:
+    ratings_by_source = {
+        rating.get("Source"): rating.get("Value")
+        for rating in payload.get("Ratings", [])
+        if rating.get("Source") and rating.get("Value")
+    }
+    return {
+        "imdb_id": payload.get("imdbID"),
+        "imdb_rating": ratings_by_source.get("Internet Movie Database")
+        or (
+            f"{payload['imdbRating']}/10"
+            if payload.get("imdbRating") and payload.get("imdbRating") != "N/A"
+            else None
+        ),
+        "imdb_votes": payload.get("imdbVotes")
+        if payload.get("imdbVotes") and payload.get("imdbVotes") != "N/A"
+        else None,
+        "rotten_tomatoes_rating": ratings_by_source.get("Rotten Tomatoes"),
+        "metacritic_rating": ratings_by_source.get("Metacritic")
+        or (
+            f"{payload['Metascore']}/100"
+            if payload.get("Metascore") and payload.get("Metascore") != "N/A"
+            else None
+        ),
+    }
+
+
+def fetch_omdb_ratings(
+    session: requests.Session,
+    api_key: str,
+    title: str,
+    year: Optional[int],
+) -> Optional[Dict[str, Optional[str]]]:
+    params: Dict[str, Any] = {"apikey": api_key, "t": title, "type": "movie"}
+    if year:
+        params["y"] = year
+    response = session.get(OMDB_API_BASE, params=params, timeout=30)
+    response.raise_for_status()
+    payload = response.json()
+    if payload.get("Response") != "True":
+        error = payload.get("Error", "Unknown OMDb error")
+        if "not found" not in error.lower():
+            raise OmdbUnavailableError(error)
+        LOGGER.info("OMDb match not found for: %s (%s)", title, year or "unknown year")
+        return None
+    return parse_omdb_ratings(payload)
+
+
+def get_cached_omdb_ratings(
+    connection: sqlite3.Connection, slug: str
+) -> Optional[Dict[str, Optional[str]]]:
+    cursor = connection.execute(
+        """
+        SELECT
+            imdb_id, imdb_rating, imdb_votes, rotten_tomatoes_rating,
+            metacritic_rating, omdb_checked_at
+        FROM films
+        WHERE slug = ?
+          AND omdb_checked_at IS NOT NULL
+        """,
+        (slug,),
+    )
+    row = cursor.fetchone()
+    if not row:
+        return None
+    return dict(zip(OMDB_RATING_FIELDS, row))
+
+
+def update_omdb_cache(
+    connection: sqlite3.Connection,
+    slug: str,
+    ratings: Dict[str, Optional[str]],
+    checked_at: str,
+) -> None:
+    connection.execute(
+        """
+        UPDATE films
+        SET
+            imdb_id = ?,
+            imdb_rating = ?,
+            imdb_votes = ?,
+            rotten_tomatoes_rating = ?,
+            metacritic_rating = ?,
+            omdb_checked_at = ?
+        WHERE slug = ?
+        """,
+        (
+            ratings.get("imdb_id"),
+            ratings.get("imdb_rating"),
+            ratings.get("imdb_votes"),
+            ratings.get("rotten_tomatoes_rating"),
+            ratings.get("metacritic_rating"),
+            checked_at,
+            slug,
+        ),
+    )
+    connection.commit()
+
+
+def enrich_rows_with_omdb(
+    connection: sqlite3.Connection,
+    rows: List[Dict[str, Any]],
+    api_key: Optional[str],
+) -> List[Dict[str, Any]]:
+    rows = [with_empty_omdb_fields(row) for row in rows]
+    if not api_key:
+        return rows
+
+    session = requests.Session()
+    enriched_rows = []
+    for index, row in enumerate(rows):
+        cached = get_cached_omdb_ratings(connection, row["slug"])
+        if cached:
+            enriched_rows.append({**row, **cached})
+            continue
+
+        ratings = None
+        titles = [row["title"]]
+        if row.get("original_title") and row["original_title"] not in titles:
+            titles.append(row["original_title"])
+        for title in titles:
+            if not title:
+                continue
+            try:
+                ratings = fetch_omdb_ratings(session, api_key, title, row.get("year"))
+            except (requests.RequestException, OmdbUnavailableError) as exc:
+                LOGGER.warning(
+                    "OMDb enrichment disabled after failure for %s: %s", title, exc
+                )
+                enriched_rows.append(row)
+                enriched_rows.extend(rows[index + 1 :])
+                return enriched_rows
+            if ratings:
+                break
+
+        checked_at = utc_now_iso()
+        ratings = ratings or {}
+        update_omdb_cache(connection, row["slug"], ratings, checked_at)
+        enriched_rows.append(
+            {
+                **row,
+                **ratings,
+                "omdb_checked_at": checked_at,
+            }
+        )
+        time.sleep(0.25)
+    return enriched_rows
+
+
 def rows_for_csv(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     return sorted(
         rows,
@@ -241,6 +418,11 @@ def write_csv(rows: List[Dict[str, Any]], output_path: str) -> None:
         "director",
         "score_10",
         "ratings_count",
+        "imdb_rating",
+        "imdb_votes",
+        "rotten_tomatoes_rating",
+        "metacritic_rating",
+        "imdb_id",
         "score_rank",
         "popularity_rank",
         "combined_rank",
@@ -248,7 +430,7 @@ def write_csv(rows: List[Dict[str, Any]], output_path: str) -> None:
         "url",
     ]
     with open(output_path, "w", newline="", encoding="utf-8") as csv_file:
-        writer = csv.DictWriter(csv_file, fieldnames=fieldnames)
+        writer = csv.DictWriter(csv_file, fieldnames=fieldnames, extrasaction="ignore")
         writer.writeheader()
         writer.writerows(rows_for_csv(rows))
 
@@ -287,6 +469,12 @@ def init_db(connection: sqlite3.Connection) -> None:
             director TEXT,
             score_10 REAL,
             ratings_count INTEGER,
+            imdb_id TEXT,
+            imdb_rating TEXT,
+            imdb_votes TEXT,
+            rotten_tomatoes_rating TEXT,
+            metacritic_rating TEXT,
+            omdb_checked_at TEXT,
             score_rank INTEGER,
             popularity_rank INTEGER,
             combined_rank REAL,
@@ -298,6 +486,14 @@ def init_db(connection: sqlite3.Connection) -> None:
         )
         """
     )
+    existing_columns = {
+        row[1] for row in connection.execute("PRAGMA table_info(films)").fetchall()
+    }
+    for column_name, column_type in OMDB_DB_COLUMNS.items():
+        if column_name not in existing_columns:
+            connection.execute(
+                f"ALTER TABLE films ADD COLUMN {column_name} {column_type}"
+            )
     connection.commit()
 
 
@@ -306,16 +502,21 @@ def sync_films_to_db(
 ) -> None:
     synced_at = utc_now_iso()
     for row in rows:
+        row = with_empty_omdb_fields(row)
         connection.execute(
             """
             INSERT INTO films (
                 slug, title, original_title, year, origin_country, director,
-                score_10, ratings_count, score_rank, popularity_rank, combined_rank,
-                collection_rank, url, first_seen_at, last_seen_at, notified_at
+                score_10, ratings_count, imdb_id, imdb_rating, imdb_votes,
+                rotten_tomatoes_rating, metacritic_rating, omdb_checked_at,
+                score_rank, popularity_rank, combined_rank, collection_rank, url,
+                first_seen_at, last_seen_at, notified_at
             ) VALUES (
                 :slug, :title, :original_title, :year, :origin_country, :director,
-                :score_10, :ratings_count, :score_rank, :popularity_rank, :combined_rank,
-                :collection_rank, :url, :first_seen_at, :last_seen_at, NULL
+                :score_10, :ratings_count, :imdb_id, :imdb_rating, :imdb_votes,
+                :rotten_tomatoes_rating, :metacritic_rating, :omdb_checked_at,
+                :score_rank, :popularity_rank, :combined_rank, :collection_rank, :url,
+                :first_seen_at, :last_seen_at, NULL
             )
             ON CONFLICT(slug) DO UPDATE SET
                 title = excluded.title,
@@ -325,6 +526,21 @@ def sync_films_to_db(
                 director = excluded.director,
                 score_10 = excluded.score_10,
                 ratings_count = excluded.ratings_count,
+                imdb_id = COALESCE(excluded.imdb_id, films.imdb_id),
+                imdb_rating = COALESCE(excluded.imdb_rating, films.imdb_rating),
+                imdb_votes = COALESCE(excluded.imdb_votes, films.imdb_votes),
+                rotten_tomatoes_rating = COALESCE(
+                    excluded.rotten_tomatoes_rating,
+                    films.rotten_tomatoes_rating
+                ),
+                metacritic_rating = COALESCE(
+                    excluded.metacritic_rating,
+                    films.metacritic_rating
+                ),
+                omdb_checked_at = COALESCE(
+                    excluded.omdb_checked_at,
+                    films.omdb_checked_at
+                ),
                 score_rank = excluded.score_rank,
                 popularity_rank = excluded.popularity_rank,
                 combined_rank = excluded.combined_rank,
@@ -350,8 +566,10 @@ def get_unnotified_rows(
     query = f"""
         SELECT
             slug, title, original_title, year, origin_country, director,
-            score_10, ratings_count, score_rank, popularity_rank, combined_rank,
-            collection_rank, url, first_seen_at, last_seen_at, notified_at
+            score_10, ratings_count, imdb_id, imdb_rating, imdb_votes,
+            rotten_tomatoes_rating, metacritic_rating, omdb_checked_at,
+            score_rank, popularity_rank, combined_rank, collection_rank, url,
+            first_seen_at, last_seen_at, notified_at
         FROM films
         WHERE slug IN ({placeholders})
           AND notified_at IS NULL
@@ -370,16 +588,33 @@ def mark_notified(connection: sqlite3.Connection, slug: str) -> None:
     connection.commit()
 
 
+def format_external_ratings(row: Dict[str, Any]) -> Optional[str]:
+    parts = []
+    if row.get("imdb_rating"):
+        parts.append(f"IMDb {row['imdb_rating']}")
+    if row.get("rotten_tomatoes_rating"):
+        parts.append(f"RT {row['rotten_tomatoes_rating']}")
+    if row.get("metacritic_rating"):
+        parts.append(f"Metacritic {row['metacritic_rating']}")
+    return " | ".join(parts) if parts else None
+
+
 def format_telegram_message(row: Dict[str, Any]) -> str:
     score_text = f"{row['score_10']:.1f}" if row.get("score_10") is not None else "N/A"
     year_text = str(row["year"]) if row.get("year") is not None else "Unknown year"
     country_text = row.get("origin_country") or "Unknown country"
     director_text = row.get("director") or "Unknown director"
-    return (
-        f"{row['title']} {score_text}\n"
-        f"{row['original_title']} | {year_text} | {country_text} | {director_text}\n"
-        f"{row['url']}"
+    lines = [f"{row['title']} - MUBI {score_text}"]
+    external_ratings = format_external_ratings(row)
+    if external_ratings:
+        lines.append(external_ratings)
+    lines.extend(
+        [
+            f"{row['original_title']} | {year_text} | {country_text} | {director_text}",
+            row["url"],
+        ]
     )
+    return "\n".join(lines)
 
 
 def send_telegram_message(bot_token: str, chat_id: str, message: str) -> None:
@@ -444,8 +679,9 @@ def main() -> int:
     )
     parser = argparse.ArgumentParser(
         description=(
-            "Extract films from a MUBI collection, write a CSV, and optionally notify Telegram "
-            "for newly added films using SQLite state."
+            "Extract films from a MUBI collection, optionally enrich external ratings, "
+            "write a CSV, and optionally notify Telegram for newly added films using "
+            "SQLite state."
         )
     )
     parser.add_argument(
@@ -465,16 +701,26 @@ def main() -> int:
     )
     args = parser.parse_args()
 
-    rows = add_rankings(scrape_collection(args.url))
+    load_dotenv(args.env_file)
+    rows = [
+        with_empty_omdb_fields(row)
+        for row in add_rankings(scrape_collection(args.url))
+    ]
     if not rows:
         LOGGER.error("No films could be extracted.")
         return 1
 
-    write_csv(rows, args.out)
-    LOGGER.info("CSV written to: %s", args.out)
-
     with sqlite3.connect(args.db_path) as connection:
         init_db(connection)
+        sync_films_to_db(connection, rows)
+        rows = enrich_rows_with_omdb(
+            connection,
+            rows,
+            api_key=os.getenv("OMDB_API_KEY"),
+        )
+        write_csv(rows, args.out)
+        LOGGER.info("CSV written to: %s", args.out)
+
         sync_films_to_db(connection, rows)
         pending_rows = get_unnotified_rows(connection, [row["slug"] for row in rows])
 

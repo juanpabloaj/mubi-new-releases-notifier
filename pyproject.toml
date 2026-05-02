@@ -1,7 +1,7 @@
 [project]
 name = "mubi-recommendations"
 version = "0.1.0"
-description = "Fetch new MUBI releases, export them to CSV, and optionally notify Telegram."
+description = "Fetch new MUBI releases, enrich ratings, export CSV, and optionally notify Telegram."
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
