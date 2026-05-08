@@ -52,6 +52,16 @@ OMDB_API_KEY=...
 
 When `OMDB_API_KEY` is set, the script queries OMDb by title and year, then falls back to original title and year. Available IMDb, Rotten Tomatoes, and Metacritic ratings are added to the CSV and Telegram messages. Missing OMDb matches do not stop the run.
 
+Optional request pacing overrides:
+
+```env
+MUBI_REQUEST_DELAY_SECONDS=0.5
+OMDB_REQUEST_DELAY_SECONDS=1.0
+TELEGRAM_SEND_DELAY_SECONDS=1.0
+```
+
+The script retries temporary HTTP failures and rate limits (`429`, `500`, `502`, `503`, `504`) with backoff. Telegram `retry_after` responses are respected before retrying.
+
 ## CSV contents
 
 The CSV includes:
@@ -141,6 +151,7 @@ The script uses Python `logging` and prints:
 - top rows by `score_rank`
 - CSV output path
 - number of Telegram notifications sent
+- temporary HTTP retry/rate-limit waits
 
 ## Notes
 

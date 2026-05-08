@@ -4,13 +4,14 @@ import csv
 import json
 import logging
 import os
+import random
 import re
 import sqlite3
 import time
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 from urllib.parse import urlparse
 
 import requests
@@ -23,6 +24,11 @@ DEFAULT_ENV_PATH = ".env"
 API_BASE = "https://api.mubi.com/v4"
 OMDB_API_BASE = "https://www.omdbapi.com/"
 LOGGER = logging.getLogger("mubi_notifier")
+MAX_HTTP_ATTEMPTS = 4
+MUBI_REQUEST_DELAY_SECONDS = 0.5
+OMDB_REQUEST_DELAY_SECONDS = 1.0
+TELEGRAM_SEND_DELAY_SECONDS = 1.0
+RETRYABLE_STATUS_CODES = {429, 500, 502, 503, 504}
 OMDB_RATING_FIELDS = [
     "imdb_id",
     "imdb_rating",
@@ -56,6 +62,126 @@ def load_dotenv(env_path: str) -> None:
         key, value = line.split("=", 1)
         value = value.strip().strip('"').strip("'")
         os.environ.setdefault(key.strip(), value)
+
+
+def get_float_env(name: str, default: float) -> float:
+    raw_value = os.getenv(name)
+    if not raw_value:
+        return default
+    try:
+        value = float(raw_value)
+    except ValueError:
+        LOGGER.warning(
+            "Invalid %s value %r. Using default %s.", name, raw_value, default
+        )
+        return default
+    return max(0.0, value)
+
+
+def retry_delay_seconds(response: Optional[requests.Response], attempt: int) -> float:
+    if response is not None:
+        retry_after = response.headers.get("Retry-After")
+        if retry_after:
+            try:
+                return max(0.0, float(retry_after))
+            except ValueError:
+                pass
+        try:
+            payload = response.json()
+        except ValueError:
+            payload = {}
+        retry_after = payload.get("parameters", {}).get("retry_after")
+        if retry_after is not None:
+            try:
+                return max(0.0, float(retry_after))
+            except (TypeError, ValueError):
+                pass
+    return (2 ** (attempt - 1)) + random.uniform(0.0, 0.5)
+
+
+def _request_with_retries(
+    request_func: Callable[..., requests.Response],
+    method: str,
+    url: str,
+    *,
+    max_attempts: int = MAX_HTTP_ATTEMPTS,
+    **kwargs: Any,
+) -> requests.Response:
+    last_error: Optional[requests.RequestException] = None
+    for attempt in range(1, max_attempts + 1):
+        response = None
+        try:
+            response = request_func(method, url, **kwargs)
+        except requests.RequestException as exc:
+            last_error = exc
+            if attempt == max_attempts:
+                raise
+            delay = retry_delay_seconds(response, attempt)
+            LOGGER.warning(
+                "HTTP %s %s failed: %s. Waiting %.1f seconds before retry %s/%s.",
+                method.upper(),
+                url,
+                exc,
+                delay,
+                attempt,
+                max_attempts,
+            )
+            time.sleep(delay)
+            continue
+
+        if response.status_code not in RETRYABLE_STATUS_CODES:
+            return response
+        if attempt == max_attempts:
+            return response
+
+        delay = retry_delay_seconds(response, attempt)
+        LOGGER.warning(
+            "HTTP %s %s returned %s. Waiting %.1f seconds before retry %s/%s.",
+            method.upper(),
+            url,
+            response.status_code,
+            delay,
+            attempt,
+            max_attempts,
+        )
+        time.sleep(delay)
+
+    if last_error:
+        raise last_error
+    raise RuntimeError("HTTP retry loop exited unexpectedly.")
+
+
+def request_with_retries(
+    method: str,
+    url: str,
+    *,
+    max_attempts: int = MAX_HTTP_ATTEMPTS,
+    **kwargs: Any,
+) -> requests.Response:
+    return _request_with_retries(
+        requests.request,
+        method,
+        url,
+        max_attempts=max_attempts,
+        **kwargs,
+    )
+
+
+def session_request_with_retries(
+    session: requests.Session,
+    method: str,
+    url: str,
+    *,
+    max_attempts: int = MAX_HTTP_ATTEMPTS,
+    **kwargs: Any,
+) -> requests.Response:
+    return _request_with_retries(
+        session.request,
+        method,
+        url,
+        max_attempts=max_attempts,
+        **kwargs,
+    )
 
 
 def extract_next_data(html: str) -> Optional[Dict[str, Any]]:
@@ -125,7 +251,7 @@ def parse_url_defaults(collection_url: str) -> Dict[str, str]:
 
 
 def bootstrap_context(session: requests.Session, collection_url: str) -> Dict[str, Any]:
-    response = session.get(collection_url, timeout=45)
+    response = session_request_with_retries(session, "GET", collection_url, timeout=45)
     response.raise_for_status()
     data = extract_next_data(response.text)
     if not data:
@@ -155,11 +281,14 @@ def fetch_collection_films(
     headers: Dict[str, str],
     total_items: Optional[int],
     per_page: int = 12,
+    request_delay_seconds: float = MUBI_REQUEST_DELAY_SECONDS,
 ) -> List[Dict[str, Any]]:
     films: List[Dict[str, Any]] = []
     page_num = 1
     while True:
-        response = session.get(
+        response = session_request_with_retries(
+            session,
+            "GET",
             f"{API_BASE}/collections/{collection_slug}/films",
             params={"page": page_num, "per_page": per_page},
             headers=headers,
@@ -176,6 +305,7 @@ def fetch_collection_films(
         if len(page_films) < per_page:
             break
         page_num += 1
+        time.sleep(request_delay_seconds)
     return films
 
 
@@ -196,6 +326,10 @@ def scrape_collection(collection_url: str) -> List[Dict[str, Any]]:
         headers,
         total_items=collection.get("total_items"),
         per_page=12,
+        request_delay_seconds=get_float_env(
+            "MUBI_REQUEST_DELAY_SECONDS",
+            MUBI_REQUEST_DELAY_SECONDS,
+        ),
     )
 
     rows: List[Dict[str, Any]] = []
@@ -283,7 +417,13 @@ def fetch_omdb_ratings(
     params: Dict[str, Any] = {"apikey": api_key, "t": title, "type": "movie"}
     if year:
         params["y"] = year
-    response = session.get(OMDB_API_BASE, params=params, timeout=30)
+    response = session_request_with_retries(
+        session,
+        "GET",
+        OMDB_API_BASE,
+        params=params,
+        timeout=30,
+    )
     response.raise_for_status()
     payload = response.json()
     if payload.get("Response") != "True":
@@ -350,6 +490,7 @@ def enrich_rows_with_omdb(
     connection: sqlite3.Connection,
     rows: List[Dict[str, Any]],
     api_key: Optional[str],
+    request_delay_seconds: float = OMDB_REQUEST_DELAY_SECONDS,
 ) -> List[Dict[str, Any]]:
     rows = [with_empty_omdb_fields(row) for row in rows]
     if not api_key:
@@ -379,6 +520,7 @@ def enrich_rows_with_omdb(
                 enriched_rows.append(row)
                 enriched_rows.extend(rows[index + 1 :])
                 return enriched_rows
+            time.sleep(request_delay_seconds)
             if ratings:
                 break
 
@@ -392,7 +534,6 @@ def enrich_rows_with_omdb(
                 "omdb_checked_at": checked_at,
             }
         )
-        time.sleep(0.25)
     return enriched_rows
 
 
@@ -618,40 +759,24 @@ def format_telegram_message(row: Dict[str, Any]) -> str:
 
 
 def send_telegram_message(bot_token: str, chat_id: str, message: str) -> None:
-    max_attempts = 6
-    for attempt in range(1, max_attempts + 1):
-        response = requests.post(
-            f"https://api.telegram.org/bot{bot_token}/sendMessage",
-            data={
-                "chat_id": chat_id,
-                "text": message,
-                "disable_web_page_preview": "true",
-            },
-            timeout=30,
-        )
+    response = request_with_retries(
+        "POST",
+        f"https://api.telegram.org/bot{bot_token}/sendMessage",
+        max_attempts=6,
+        data={
+            "chat_id": chat_id,
+            "text": message,
+            "disable_web_page_preview": "true",
+        },
+        timeout=30,
+    )
+    response.raise_for_status()
+    try:
+        payload = response.json()
+    except ValueError:
         payload = {}
-        try:
-            payload = response.json()
-        except ValueError:
-            payload = {}
-
-        if response.status_code == 429:
-            retry_after = payload.get("parameters", {}).get("retry_after", 5)
-            LOGGER.warning(
-                "Telegram rate limit hit. Waiting %s seconds before retry %s/%s.",
-                retry_after,
-                attempt,
-                max_attempts,
-            )
-            time.sleep(retry_after)
-            continue
-
-        response.raise_for_status()
-        if not payload.get("ok"):
-            raise RuntimeError(f"Telegram API error: {payload}")
-        return
-
-    raise RuntimeError("Telegram rate limit retries exhausted.")
+    if not payload.get("ok"):
+        raise RuntimeError(f"Telegram API error: {payload}")
 
 
 def notify_rows(
@@ -665,10 +790,14 @@ def notify_rows(
             "TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID must be set to send notifications."
         )
 
+    send_delay_seconds = get_float_env(
+        "TELEGRAM_SEND_DELAY_SECONDS",
+        TELEGRAM_SEND_DELAY_SECONDS,
+    )
     for row in rows:
         send_telegram_message(bot_token, chat_id, format_telegram_message(row))
         mark_notified(connection, row["slug"])
-        time.sleep(1)
+        time.sleep(send_delay_seconds)
     return len(rows)
 
 
@@ -703,8 +832,7 @@ def main() -> int:
 
     load_dotenv(args.env_file)
     rows = [
-        with_empty_omdb_fields(row)
-        for row in add_rankings(scrape_collection(args.url))
+        with_empty_omdb_fields(row) for row in add_rankings(scrape_collection(args.url))
     ]
     if not rows:
         LOGGER.error("No films could be extracted.")
@@ -717,6 +845,10 @@ def main() -> int:
             connection,
             rows,
             api_key=os.getenv("OMDB_API_KEY"),
+            request_delay_seconds=get_float_env(
+                "OMDB_REQUEST_DELAY_SECONDS",
+                OMDB_REQUEST_DELAY_SECONDS,
+            ),
         )
         write_csv(rows, args.out)
         LOGGER.info("CSV written to: %s", args.out)
