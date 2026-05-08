@@ -112,6 +112,14 @@ uv run new_on_mubi_notifier.py \
 
 If you have already activated `.venv`, `python new_on_mubi_notifier.py` also works.
 
+## Testing
+
+Run the unit test suite:
+
+```bash
+uv run pytest
+```
+
 ## Notification behavior
 
 - The first `--notify` run sends all currently known films.

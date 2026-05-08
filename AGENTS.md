@@ -18,6 +18,7 @@ If the project grows, keep source code under a dedicated package directory such 
 - `python new_on_mubi_notifier.py --out new_on_mubi.csv`: fetch collection data and regenerate the CSV.
 - `python new_on_mubi_notifier.py --out new_on_mubi.csv --db-path mubi_notifications.db --env-file .env --notify`: run the full notifier flow, including SQLite sync and Telegram sends.
 - `python -m py_compile new_on_mubi_notifier.py`: quick syntax validation before committing.
+- `uv run pytest`: run the test suite.
 
 ## Coding Style & Naming Conventions
 
@@ -29,13 +30,11 @@ If the project grows, keep source code under a dedicated package directory such 
 
 ## Testing Guidelines
 
-There is no formal test suite yet. For now:
+The test suite uses `pytest` and lives under `tests/`.
 
 - run `python -m py_compile new_on_mubi_notifier.py`
-- run the script once without `--notify`
-- inspect the generated CSV and log output
-
-When tests are added, use `pytest` and name files `test_*.py`.
+- run `uv run pytest`
+- for fetch/export changes, run the script once without `--notify` and inspect the generated CSV/log output
 
 ## Commit & Pull Request Guidelines
 
