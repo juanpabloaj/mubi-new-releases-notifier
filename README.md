@@ -70,6 +70,7 @@ The CSV includes:
 - `title`
 - `original_title`
 - `year`
+- `duration`
 - `origin_country`
 - `director`
 - `score_10`
@@ -131,7 +132,7 @@ Message format:
 ```text
 <title> - MUBI <score_10>
 <IMDb rating> | <Rotten Tomatoes rating> | <Metacritic rating>
-<original_title> | <year> | <origin_country> | <director>
+<original_title> | <year> | <duration> | <origin_country> | <director>
 <url>
 ```
 

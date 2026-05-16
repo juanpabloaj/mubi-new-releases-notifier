@@ -224,6 +224,7 @@ def normalize_film_data(film: Dict[str, Any]) -> Dict[str, Any]:
         "title": film.get("title"),
         "original_title": film.get("original_title") or film.get("title"),
         "year": film.get("year"),
+        "duration": film.get("duration"),
         "origin_country": ", ".join(countries) if countries else None,
         "director": join_directors(film.get("directors")),
         "slug": film.get("slug"),
@@ -555,6 +556,7 @@ def write_csv(rows: List[Dict[str, Any]], output_path: str) -> None:
         "title",
         "original_title",
         "year",
+        "duration",
         "origin_country",
         "director",
         "score_10",
@@ -606,6 +608,7 @@ def init_db(connection: sqlite3.Connection) -> None:
             title TEXT NOT NULL,
             original_title TEXT,
             year INTEGER,
+            duration INTEGER,
             origin_country TEXT,
             director TEXT,
             score_10 REAL,
@@ -635,6 +638,8 @@ def init_db(connection: sqlite3.Connection) -> None:
             connection.execute(
                 f"ALTER TABLE films ADD COLUMN {column_name} {column_type}"
             )
+    if "duration" not in existing_columns:
+        connection.execute("ALTER TABLE films ADD COLUMN duration INTEGER")
     connection.commit()
 
 
@@ -647,13 +652,14 @@ def sync_films_to_db(
         connection.execute(
             """
             INSERT INTO films (
-                slug, title, original_title, year, origin_country, director,
+                slug, title, original_title, year, duration, origin_country, director,
                 score_10, ratings_count, imdb_id, imdb_rating, imdb_votes,
                 rotten_tomatoes_rating, metacritic_rating, omdb_checked_at,
                 score_rank, popularity_rank, combined_rank, collection_rank, url,
                 first_seen_at, last_seen_at, notified_at
             ) VALUES (
-                :slug, :title, :original_title, :year, :origin_country, :director,
+                :slug, :title, :original_title, :year, :duration,
+                :origin_country, :director,
                 :score_10, :ratings_count, :imdb_id, :imdb_rating, :imdb_votes,
                 :rotten_tomatoes_rating, :metacritic_rating, :omdb_checked_at,
                 :score_rank, :popularity_rank, :combined_rank, :collection_rank, :url,
@@ -663,6 +669,7 @@ def sync_films_to_db(
                 title = excluded.title,
                 original_title = excluded.original_title,
                 year = excluded.year,
+                duration = excluded.duration,
                 origin_country = excluded.origin_country,
                 director = excluded.director,
                 score_10 = excluded.score_10,
@@ -706,7 +713,7 @@ def get_unnotified_rows(
     placeholders = ", ".join("?" for _ in current_slugs)
     query = f"""
         SELECT
-            slug, title, original_title, year, origin_country, director,
+            slug, title, original_title, year, duration, origin_country, director,
             score_10, ratings_count, imdb_id, imdb_rating, imdb_votes,
             rotten_tomatoes_rating, metacritic_rating, omdb_checked_at,
             score_rank, popularity_rank, combined_rank, collection_rank, url,
@@ -743,6 +750,11 @@ def format_external_ratings(row: Dict[str, Any]) -> Optional[str]:
 def format_telegram_message(row: Dict[str, Any]) -> str:
     score_text = f"{row['score_10']:.1f}" if row.get("score_10") is not None else "N/A"
     year_text = str(row["year"]) if row.get("year") is not None else "Unknown year"
+    duration_text = (
+        f"{row['duration']} min"
+        if row.get("duration") is not None
+        else "Unknown runtime"
+    )
     country_text = row.get("origin_country") or "Unknown country"
     director_text = row.get("director") or "Unknown director"
     lines = [f"{row['title']} - MUBI {score_text}"]
@@ -751,7 +763,10 @@ def format_telegram_message(row: Dict[str, Any]) -> str:
         lines.append(external_ratings)
     lines.extend(
         [
-            f"{row['original_title']} | {year_text} | {country_text} | {director_text}",
+            (
+                f"{row['original_title']} | {year_text} | "
+                f"{duration_text} | {country_text} | {director_text}"
+            ),
             row["url"],
         ]
     )

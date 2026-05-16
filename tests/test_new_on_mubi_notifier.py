@@ -12,6 +12,7 @@ def sample_row(slug: str, title: str, score_10: float, ratings_count: int) -> di
         "title": title,
         "original_title": title,
         "year": 2024,
+        "duration": 88,
         "origin_country": "Chile",
         "director": "Test Director",
         "slug": slug,
@@ -103,7 +104,7 @@ def test_format_telegram_message_includes_external_ratings_when_available():
     assert notifier.format_telegram_message(row) == (
         "Arco - MUBI 9.4\n"
         "IMDb 7.5/10 | RT 93% | Metacritic 73/100\n"
-        "Arco | 2024 | Chile | Test Director\n"
+        "Arco | 2024 | 88 min | Chile | Test Director\n"
         "https://mubi.com/films/arco"
     )
 
@@ -113,7 +114,18 @@ def test_format_telegram_message_omits_external_ratings_when_missing():
 
     assert notifier.format_telegram_message(row) == (
         "Arco - MUBI 9.4\n"
-        "Arco | 2024 | Chile | Test Director\n"
+        "Arco | 2024 | 88 min | Chile | Test Director\n"
+        "https://mubi.com/films/arco"
+    )
+
+
+def test_format_telegram_message_uses_unknown_runtime_when_missing():
+    row = sample_row("arco", "Arco", 9.4, 100)
+    row["duration"] = None
+
+    assert notifier.format_telegram_message(row) == (
+        "Arco - MUBI 9.4\n"
+        "Arco | 2024 | Unknown runtime | Chile | Test Director\n"
         "https://mubi.com/films/arco"
     )
 
@@ -148,11 +160,12 @@ def test_sqlite_sync_preserves_first_seen_and_filters_notified_rows():
 
     updated_rows = notifier.add_rankings([sample_row("arco", "Arco Updated", 9.2, 120)])
     notifier.sync_films_to_db(connection, updated_rows)
-    title, updated_first_seen_at = connection.execute(
-        "SELECT title, first_seen_at FROM films WHERE slug = 'arco'"
+    title, duration, updated_first_seen_at = connection.execute(
+        "SELECT title, duration, first_seen_at FROM films WHERE slug = 'arco'"
     ).fetchone()
 
     assert title == "Arco Updated"
+    assert duration == 88
     assert updated_first_seen_at == first_seen_at
     assert len(notifier.get_unnotified_rows(connection, ["arco"])) == 1
 
@@ -181,3 +194,4 @@ def test_init_db_adds_omdb_columns_to_existing_table():
         row[1] for row in connection.execute("PRAGMA table_info(films)").fetchall()
     }
     assert set(notifier.OMDB_DB_COLUMNS).issubset(columns)
+    assert "duration" in columns
